@@ -3,7 +3,7 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
 export default defineConfig({
-  base: '/marketing_capsule_V1.2/',
+  base: '/Marketing_capsule_V1.2/',
 
   server: {
     port: 3000,
