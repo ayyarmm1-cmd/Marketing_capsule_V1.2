@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Create Demo Owner Account</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+        input, select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            margin-top: 10px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+            display: none;
+        }
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Create Demo Owner Account</h1>
+        <p style="color: #666; margin-bottom: 20px;">
+            This tool will create a Demo Owner account. You must be logged in as an Owner or Admin to use this.
+        </p>
+        
+        <div class="form-group">
+            <label for="name">Full Name*</label>
+            <input type="text" id="name" value="Demo Owner" required>
+        </div>
+        
+        <div class="form-group">
+            <label for="email">Email*</label>
+            <input type="email" id="email" value="demo@upwardmm.com" required>
+        </div>
+        
+        <div class="form-group">
+            <label for="password">Initial Password*</label>
+            <input type="password" id="password" placeholder="Enter password" required>
+        </div>
+        
+        <div class="form-group">
+            <label for="departmentId">Department*</label>
+            <select id="departmentId" required>
+                <option value="">Loading departments...</option>
+            </select>
+        </div>
+        
+        <div class="form-group">
+            <label for="jobTitle">Job Title*</label>
+            <input type="text" id="jobTitle" value="Demo Owner" required>
+        </div>
+        
+        <div class="form-group">
+            <label for="basicPay">Basic Pay (MMK)*</label>
+            <input type="number" id="basicPay" value="0" min="0" required>
+        </div>
+        
+        <div class="form-group">
+            <label for="joiningDate">Joining Date*</label>
+            <input type="date" id="joiningDate" required>
+        </div>
+        
+        <button id="createBtn" onclick="createDemoOwner()">Create Demo Owner Account</button>
+        
+        <div id="status" class="status"></div>
+    </div>
+
+    <script type="module">
+        // Import Firebase and API functions
+        import { apiAddEmployee } from './services/api.js';
+        import { apiGetDepartments } from './services/api.js';
+        import { UserRole, EmployeeStatus } from './types.js';
+
+        // Set today's date as default
+        document.getElementById('joiningDate').value = new Date().toISOString().split('T')[0];
+
+        // Load departments
+        async function loadDepartments() {
+            try {
+                const departments = await apiGetDepartments();
+                const select = document.getElementById('departmentId');
+                select.innerHTML = '<option value="">-- Select Department --</option>';
+                departments.forEach(dept => {
+                    const option = document.createElement('option');
+                    option.value = dept.id;
+                    option.textContent = dept.name;
+                    if (dept.name.toLowerCase().includes('management')) {
+                        option.selected = true;
+                    }
+                    select.appendChild(option);
+                });
+            } catch (error) {
+                showStatus('error', 'Failed to load departments: ' + error.message);
+            }
+        }
+
+        window.createDemoOwner = async function() {
+            const name = document.getElementById('name').value.trim();
+            const email = document.getElementById('email').value.trim();
+            const password = document.getElementById('password').value;
+            const departmentId = document.getElementById('departmentId').value;
+            const jobTitle = document.getElementById('jobTitle').value.trim();
+            const basicPay = parseFloat(document.getElementById('basicPay').value);
+            const joiningDate = document.getElementById('joiningDate').value;
+
+            if (!name || !email || !password || !departmentId || !jobTitle || isNaN(basicPay) || !joiningDate) {
+                showStatus('error', 'Please fill in all required fields.');
+                return;
+            }
+
+            const btn = document.getElementById('createBtn');
+            btn.disabled = true;
+            btn.textContent = 'Creating...';
+
+            try {
+                const employeeData = {
+                    name,
+                    email,
+                    role: UserRole.DEMO_OWNER,
+                    departmentId,
+                    jobTitle,
+                    basicPay,
+                    joiningDate,
+                    employeeStatus: EmployeeStatus.ON_PROBATION,
+                    hasLoginAccess: true,
+                    requiresPasswordChange: true,
+                    paymentType: 'Monthly',
+                    tempPassword: password,
+                };
+
+                const result = await apiAddEmployee(employeeData);
+                showStatus('success', `Demo Owner account created successfully! Employee ID: ${result.employeeId}`);
+                document.getElementById('createBtn').textContent = 'Create Another';
+            } catch (error) {
+                showStatus('error', 'Failed to create account: ' + error.message);
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        function showStatus(type, message) {
+            const status = document.getElementById('status');
+            status.className = 'status ' + type;
+            status.textContent = message;
+            status.style.display = 'block';
+        }
+
+        // Load departments on page load
+        loadDepartments();
+    </script>
+</body>
+</html>
+

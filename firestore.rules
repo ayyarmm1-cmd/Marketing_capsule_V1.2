@@ -1,0 +1,904 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- HELPER FUNCTIONS ---
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isSelf(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    function isOwnerRole(role) {
+      return role is string && (role == 'Owner' || role == 'owner' || role == 'OWNER');
+    }
+    
+    function isAdminRole(role) {
+      return role is string && (role == 'Admin' || role == 'admin' || role == 'ADMIN');
+    }
+    
+    function hasPermission(permission) {
+      let userData = getUserData();
+      let userRole = userData.role;
+      let userDeptId = 'departmentId' in userData && userData.departmentId != null ? userData.departmentId : '';
+      
+      // Permission checks in order of precedence: Owner/Admin > User Override > Department Override > Global Role > Default
+      return isAuthenticated() && (
+        isOwnerRole(userRole) || isAdminRole(userRole) ||
+        (
+          'permissions' in userData && userData.permissions is list && permission in userData.permissions
+        ) ||
+        (
+          userDeptId != '' &&
+          exists(/databases/$(database)/documents/role_permissions/$(userDeptId + '_' + userRole)) &&
+          permission in get(/databases/$(database)/documents/role_permissions/$(userDeptId + '_' + userRole)).data.permissions
+        ) ||
+        (
+          exists(/databases/$(database)/documents/role_permissions/$('GLOBAL_' + userRole)) &&
+          permission in get(/databases/$(database)/documents/role_permissions/$('GLOBAL_' + userRole)).data.permissions
+        )
+      );
+    }
+    
+    function isOwnerOfDoc() {
+      return ('createdByUserId' in resource.data && resource.data.createdByUserId == request.auth.uid) ||
+              ('inChargeUserId' in resource.data && resource.data.inChargeUserId == request.auth.uid);
+    }
+    
+    function isAdmin() {
+      // This is a broad definition, used for public content management.
+      // Be cautious if using for more sensitive operations.
+      let role = getUserData().role;
+      return isAuthenticated() && (isOwnerRole(role) || isAdminRole(role));
+    }
+
+    // Shared helpers: keep client/business/finance rule checks aligned with app permissions
+    function canEditClientsOrBusinesses() {
+      return hasPermission('EDIT_CLIENT') || hasPermission('EDIT_BUSINESS') ||
+             hasPermission('CREATE_CLIENT') || hasPermission('CREATE_BUSINESS') ||
+             hasPermission('IMPORT_CLIENTS_BUSINESSES');
+    }
+
+    function canReadClientBusinessFinanceData() {
+      return hasPermission('VIEW_CLIENTS_BUSINESSES') ||
+             hasPermission('VIEW_ALL_CLIENTS_BUSINESSES') ||
+             canEditClientsOrBusinesses() ||
+             hasPermission('CREATE_SALE_RECORD') ||
+             hasPermission('EDIT_SALE_RECORD') ||
+             hasPermission('EDIT_ALL_SALE_RECORDS') ||
+             hasPermission('CHECK_SALE_RECORD') ||
+             hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+             hasPermission('MANAGE_INVOICES') ||
+             hasPermission('MANAGE_QUOTATIONS') ||
+             hasPermission('VIEW_FINANCE_DASHBOARD');
+    }
+    
+
+    // --- USERS & EMPLOYEES ---
+    match /users/{userId} {
+      // Self reads never consult hasPermission() to avoid recursive lookups.
+      allow get: if isAuthenticated() && isSelf(userId);
+      // Admin/HR reads (non-self) still require permissions and demo isolation.
+      allow get: if isAuthenticated() && hasPermission('VIEW_STAFF_LIST');
+      
+      allow list: if isAuthenticated();
+      allow create: if hasPermission('CREATE_STAFF');
+      
+      // Allow users to update their own requiresPasswordChange field when changing passwords
+      // This is needed for password change flow, even if they don't have full profile edit permissions
+      // Very lenient rule: allow if user is updating requiresPasswordChange to false on their own document
+      allow update: if isAuthenticated() && isSelf(userId) && 
+        // Check if requiresPasswordChange is being set to false
+        request.resource.data.requiresPasswordChange == false &&
+        (!('requiresPasswordChange' in resource.data) || resource.data.requiresPasswordChange == true) &&
+        // Ensure critical immutable fields are not being changed (if they exist in request)
+        (!('id' in request.resource.data) || !('id' in resource.data) || request.resource.data.id == resource.data.id) &&
+        (!('email' in request.resource.data) || !('email' in resource.data) || request.resource.data.email == resource.data.email) &&
+        (!('role' in request.resource.data) || !('role' in resource.data) || request.resource.data.role == resource.data.role) &&
+        (!('employeeId' in request.resource.data) || !('employeeId' in resource.data) || request.resource.data.employeeId == resource.data.employeeId);
+      
+      // Self updates (profile edits) without triggering hasPermission recursion.
+      // Employee ID is immutable for self-service profile edits; use EDIT_STAFF to change it.
+      allow update: if isAuthenticated() && isSelf(userId) && hasPermission('EDIT_OWN_PROFILE_LIMITED') &&
+        (!('employeeId' in request.resource.data) || !('employeeId' in resource.data) || request.resource.data.employeeId == resource.data.employeeId);
+      // Admin/Owner/HR: full staff edits including employeeId
+      allow update: if hasPermission('EDIT_STAFF');
+      
+      allow delete: if hasPermission('DELETE_STAFF') && request.auth.uid != userId;
+      
+      match /notifications/{notificationId} {
+        allow read, write: if isSelf(userId);
+      }
+    }
+    
+    // --- LEADS & ACTIVITIES ---
+    match /leads/{leadId} {
+      allow get: if (hasPermission('VIEW_ALL_LEADS') || (hasPermission('VIEW_LEADS') && isOwnerOfDoc()));
+      allow list: if isAuthenticated();
+      allow create: if hasPermission('CREATE_LEAD') && request.resource.data.createdByUserId == request.auth.uid;
+      allow update: if (hasPermission('EDIT_ALL_LEADS') || (hasPermission('EDIT_LEAD') && isOwnerOfDoc()) || hasPermission('CONVERT_LEAD') || hasPermission('MERGE_CLIENTS') || hasPermission('MERGE_BUSINESSES'));
+      allow delete: if (hasPermission('DELETE_ALL_LEADS') || (hasPermission('DELETE_LEAD') && isOwnerOfDoc()));
+    }
+    
+    match /lead_activities/{activityId} {
+        allow create: if hasPermission('CREATE_LEAD');
+        allow list: if hasPermission('VIEW_LEAD_ACTIVITIES') || hasPermission('VIEW_ALL_LEADS');
+        allow get: if (hasPermission('VIEW_LEAD_ACTIVITIES') || hasPermission('VIEW_ALL_LEADS'));
+        allow update, delete: if hasPermission('EDIT_ALL_LEADS');
+    }
+    
+    match /lead_settings/{settingId} {
+        allow get, list: if hasPermission('VIEW_LEAD_ANALYTICS') || hasPermission('MANAGE_LEAD_SETTINGS');
+        allow create, update, delete: if hasPermission('MANAGE_LEAD_SETTINGS');
+    }
+    
+    // --- CLIENTS & BUSINESSES ---
+    match /clients/{clientId} {
+      allow get: if (hasPermission('VIEW_ALL_CLIENTS_BUSINESSES') || hasPermission('VIEW_CLIENTS_BUSINESSES'));
+      allow list: if isAuthenticated();
+      allow create: if hasPermission('CREATE_CLIENT') || hasPermission('CONVERT_LEAD') || hasPermission('IMPORT_CLIENTS_BUSINESSES');
+      // Allow balance updates when user has permission to create/edit sales or manage payments
+      // Allow opening balance updates for MANAGE_ACCOUNTS_RECEIVABLE (AR opening balance)
+      // MERGE_CLIENTS allows updating remaining client during merge
+      // MERGE_BUSINESSES allows updating linkedBusinessIds during business merge
+      allow update: if hasPermission('EDIT_CLIENT') ||
+                     hasPermission('EDIT_BUSINESS') ||
+                     hasPermission('CREATE_BUSINESS') ||
+                     hasPermission('EDIT_SALE_RECORD') ||
+                     hasPermission('EDIT_ALL_SALE_RECORDS') ||
+                     hasPermission('CHECK_SALE_RECORD') ||
+                     hasPermission('CREATE_SALE_RECORD') ||
+                     hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+                     hasPermission('MANAGE_INVOICES') ||
+                     hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') ||
+                     hasPermission('MERGE_CLIENTS') ||
+                     hasPermission('MERGE_BUSINESSES');
+      // MERGE_CLIENTS allows deleting merged (duplicate) clients during merge
+      allow delete: if hasPermission('DELETE_CLIENT') || hasPermission('MERGE_CLIENTS');
+    }
+    
+    // Merge snapshots - required for merge/unmerge clients. Users need MERGE_CLIENTS or DELETE_CLIENT.
+    match /merge_snapshots/{snapshotId} {
+      allow get, list: if hasPermission('MERGE_CLIENTS') || hasPermission('DELETE_CLIENT');
+      allow create: if hasPermission('MERGE_CLIENTS') || hasPermission('DELETE_CLIENT');
+      allow update, delete: if hasPermission('MERGE_CLIENTS') || hasPermission('DELETE_CLIENT');
+    }
+
+    // Business merge snapshots - merge/unmerge businesses. Users need MERGE_BUSINESSES or DELETE_BUSINESS.
+    match /business_merge_snapshots/{snapshotId} {
+      allow get, list: if hasPermission('MERGE_BUSINESSES') || hasPermission('DELETE_BUSINESS');
+      allow create: if hasPermission('MERGE_BUSINESSES') || hasPermission('DELETE_BUSINESS');
+      allow update, delete: if hasPermission('MERGE_BUSINESSES') || hasPermission('DELETE_BUSINESS');
+    }
+
+    match /businesses/{businessId} {
+      allow get: if (hasPermission('VIEW_ALL_CLIENTS_BUSINESSES') || hasPermission('VIEW_CLIENTS_BUSINESSES'));
+      allow list: if isAuthenticated();
+      allow create: if hasPermission('CREATE_BUSINESS') || hasPermission('CONVERT_LEAD') || hasPermission('IMPORT_CLIENTS_BUSINESSES');
+      // Allow opening balance updates for MANAGE_ACCOUNTS_RECEIVABLE (AR opening balance)
+      // MERGE_CLIENTS allows updating linkedClientIds during merge
+      // MERGE_BUSINESSES allows updating remaining business during merge / restoring on unmerge
+      allow update: if hasPermission('EDIT_BUSINESS') || 
+                     hasPermission('EDIT_CLIENT') ||
+                     hasPermission('CREATE_CLIENT') ||
+                     hasPermission('EDIT_SALE_RECORD') || 
+                     hasPermission('EDIT_ALL_SALE_RECORDS') ||
+                     hasPermission('CHECK_SALE_RECORD') ||
+                     hasPermission('CREATE_SALE_RECORD') ||
+                     hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+                     hasPermission('MANAGE_INVOICES') ||
+                     hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') ||
+                     hasPermission('MERGE_CLIENTS') ||
+                     hasPermission('MERGE_BUSINESSES');
+      // MERGE_BUSINESSES allows deleting merged (duplicate) businesses during merge
+      allow delete: if hasPermission('DELETE_BUSINESS') || hasPermission('MERGE_BUSINESSES');
+    }
+    
+    // Client-Business Balance collection (used for tracking balances per client-business pair)
+    // Includes openingBalance, openingBalancePaid, openingBalanceSetDate for opening balance records
+    match /client_business_balances/{balanceId} {
+      allow get: if canReadClientBusinessFinanceData() || hasPermission('MANAGE_ACCOUNTS_RECEIVABLE');
+      allow list: if isAuthenticated() && (canReadClientBusinessFinanceData() || hasPermission('MANAGE_ACCOUNTS_RECEIVABLE'));
+      // Allow create/update for sales, payments, and opening balance (manual entry / Excel import)
+      // MERGE_CLIENTS allows create/update/delete of pair balances during merge
+      // MERGE_BUSINESSES allows create/update/delete during business merge
+      allow create, update: if hasPermission('CREATE_SALE_RECORD') ||
+                             hasPermission('EDIT_SALE_RECORD') ||
+                             hasPermission('EDIT_ALL_SALE_RECORDS') ||
+                             hasPermission('CHECK_SALE_RECORD') ||
+                             hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+                             hasPermission('MANAGE_INVOICES') ||
+                             hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') ||
+                             hasPermission('EDIT_CLIENT') ||
+                             hasPermission('EDIT_BUSINESS') ||
+                             hasPermission('IMPORT_CLIENTS_BUSINESSES') ||
+                             hasPermission('MERGE_CLIENTS') ||
+                             hasPermission('MERGE_BUSINESSES');
+      allow delete: if hasPermission('EDIT_CLIENT') || hasPermission('EDIT_BUSINESS') || hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') || hasPermission('MERGE_CLIENTS') || hasPermission('MERGE_BUSINESSES');
+    }
+    
+    match /notes/{noteId} {
+        allow get: if hasPermission('VIEW_CLIENTS_BUSINESSES');
+        allow create: if hasPermission('VIEW_CLIENTS_BUSINESSES');
+        allow list: if isAuthenticated();
+        allow update: if (hasPermission('EDIT_CLIENT') || hasPermission('EDIT_BUSINESS') || hasPermission('MERGE_CLIENTS') || hasPermission('MERGE_BUSINESSES'));
+        allow delete: if (hasPermission('EDIT_CLIENT') || hasPermission('EDIT_BUSINESS'));
+    }
+    
+    // --- SERVICES ---
+    match /serviceCategories/{categoryId} {
+      allow read: if true;
+      allow list: if true;
+      allow write: if hasPermission('MANAGE_SERVICES');
+    }
+    
+    match /services/{serviceId} {
+      allow read: if true;
+      allow write: if hasPermission('MANAGE_SERVICES');
+    }
+
+    // --- PROMOTIONS ---
+    match /promotions/{promotionId} {
+      // Any authenticated user can read promotions to apply them in quotes/sales.
+      allow read: if isAuthenticated();
+      
+      // Only users with the specific permission can create, update, or delete promotions.
+      allow create: if hasPermission('MANAGE_PROMOTIONS');
+      allow update, delete: if hasPermission('MANAGE_PROMOTIONS');
+    }
+    
+    // --- SALES ---
+    match /sales/{saleId} {
+      // Allow get if user has permission to view sales records
+      allow get: if (hasPermission('VIEW_ALL_SALES_RECORDS') || 
+                    (hasPermission('VIEW_SALES_RECORDS') && isOwnerOfDoc()) ||
+                    (hasPermission('VIEW_CLIENTS_BUSINESSES') && (
+                      resource.data.clientId != null || 
+                      resource.data.businessId != null
+                    )));
+      // Allow list for authenticated users (queries are filtered by clientId/businessId in the app)
+      // This allows the Client/Business detail pages to query sales for a specific client/business
+      allow list: if isAuthenticated() && canReadClientBusinessFinanceData(); 
+      allow create: if hasPermission('CREATE_SALE_RECORD');
+      allow update: if (
+        // Regular edits require EDIT permissions
+        (hasPermission('EDIT_ALL_SALE_RECORDS') || (hasPermission('EDIT_SALE_RECORD') && isOwnerOfDoc())) ||
+        // Payments/credit notes update sale.amountPaid during allocation
+        hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+        hasPermission('MANAGE_ACCOUNTS_PAYABLE') ||
+        // Status change from DRAFT to CHECKED requires CHECK_SALE_RECORD permission
+        (hasPermission('CHECK_SALE_RECORD') && 
+         resource.data.status == 'Draft' && 
+         request.resource.data.status == 'Checked') ||
+        // Merge updates clientId on sales
+        hasPermission('MERGE_CLIENTS') ||
+        // Merge updates businessId on sales
+        hasPermission('MERGE_BUSINESSES')
+      );
+      allow delete: if (hasPermission('DELETE_ALL_SALE_RECORDS') || (hasPermission('DELETE_SALE_RECORD') && isOwnerOfDoc()));
+    }
+    
+    // --- FINANCE ---
+    match /invoices/{invoiceId} {
+      // Allow get if user has permission to manage invoices or view clients/businesses
+      // This allows viewing invoices on Client/Business detail pages
+      allow get: if (hasPermission('MANAGE_INVOICES') ||
+                    (hasPermission('VIEW_CLIENTS_BUSINESSES') && (
+                      resource.data.clientId != null || 
+                      resource.data.businessId != null
+                    )));
+      allow create: if hasPermission('MANAGE_INVOICES');
+      allow update, delete: if hasPermission('MANAGE_INVOICES') || hasPermission('MANAGE_PAYMENTS_RECEIPTS') || hasPermission('MERGE_CLIENTS') || hasPermission('MERGE_BUSINESSES');
+      // Allow list for authenticated users with proper permissions
+      // Queries are filtered by clientId/businessId in the app for detail pages
+      allow list: if isAuthenticated() && canReadClientBusinessFinanceData();
+    }
+    
+    match /quotations/{quotationId} {
+      // Allow get if user has permission to manage quotations or view clients/businesses
+      // This allows viewing quotations on Client/Business detail pages
+      allow get: if (hasPermission('MANAGE_QUOTATIONS') ||
+                    (hasPermission('VIEW_CLIENTS_BUSINESSES') && (
+                      resource.data.clientId != null || 
+                      resource.data.businessId != null
+                    )));
+      allow create: if hasPermission('MANAGE_QUOTATIONS');
+      allow update, delete: if hasPermission('MANAGE_QUOTATIONS') || hasPermission('MERGE_CLIENTS') || hasPermission('MERGE_BUSINESSES');
+      // Allow list for authenticated users with proper permissions
+      // Queries are filtered by clientId/businessId in the app for detail pages
+      allow list: if isAuthenticated() && (
+                    hasPermission('MANAGE_QUOTATIONS') ||
+                    hasPermission('VIEW_CLIENTS_BUSINESSES')
+                  );
+    }
+    
+    match /payments/{paymentId} {
+      allow get: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+        hasPermission('VIEW_CLIENTS_BUSINESSES')
+      );
+      allow list: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+        hasPermission('VIEW_CLIENTS_BUSINESSES') ||
+        hasPermission('EDIT_CLIENT') ||
+        hasPermission('EDIT_BUSINESS')
+      );
+      allow create: if hasPermission('MANAGE_PAYMENTS_RECEIPTS');
+      allow update: if (
+        // Regular updates require MANAGE_PAYMENTS_RECEIPTS or client/business edit access
+        hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+        hasPermission('EDIT_CLIENT') ||
+        hasPermission('EDIT_BUSINESS') ||
+        // Status change from PENDING to APPROVED/NOT_APPROVED requires APPROVE_PAYMENT
+        (hasPermission('APPROVE_PAYMENT') && 
+         resource.data.status == 'Pending' && 
+         (request.resource.data.status == 'Approved' || request.resource.data.status == 'Not Approved')) ||
+        // Merge updates clientId on payments
+        hasPermission('MERGE_CLIENTS') ||
+        // Merge updates businessId on payments
+        hasPermission('MERGE_BUSINESSES')
+      );
+      allow delete: if hasPermission('MANAGE_PAYMENTS_RECEIPTS') || hasPermission('EDIT_CLIENT') || hasPermission('EDIT_BUSINESS');
+      // Allow list for authenticated users with proper permissions
+      // Queries are filtered by clientId/businessId in the app for detail pages
+      allow list: if isAuthenticated() && (
+                    hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+                    hasPermission('VIEW_CLIENTS_BUSINESSES') ||
+                    hasPermission('EDIT_CLIENT') ||
+                    hasPermission('EDIT_BUSINESS')
+                  );
+    }
+    
+    match /credit_notes/{creditNoteId} {
+      allow get: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_ACCOUNTS_PAYABLE') ||
+        hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+        hasPermission('VIEW_CLIENTS_BUSINESSES') ||
+        hasPermission('CHECK_SALE_RECORD') ||
+        hasPermission('VIEW_SALES_RECORDS') ||
+        hasPermission('VIEW_ALL_SALES_RECORDS')
+      );
+      allow list: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_ACCOUNTS_PAYABLE') ||
+        hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+        hasPermission('VIEW_CLIENTS_BUSINESSES') ||
+        hasPermission('CHECK_SALE_RECORD') ||
+        hasPermission('VIEW_SALES_RECORDS') ||
+        hasPermission('VIEW_ALL_SALES_RECORDS') ||
+        hasPermission('EDIT_CLIENT') ||
+        hasPermission('EDIT_BUSINESS')
+      );
+      allow create: if hasPermission('MANAGE_ACCOUNTS_PAYABLE') || hasPermission('MANAGE_PAYMENTS_RECEIPTS') || hasPermission('CHECK_SALE_RECORD');
+      allow update: if (
+        (hasPermission('MANAGE_ACCOUNTS_PAYABLE') || hasPermission('MANAGE_PAYMENTS_RECEIPTS') || hasPermission('CHECK_SALE_RECORD')) ||
+        (hasPermission('MANAGE_ACCOUNTS_PAYABLE') && 
+         resource.data.status == 'Pending' && 
+         request.resource.data.status == 'Approved') ||
+        hasPermission('MERGE_CLIENTS') ||
+        hasPermission('MERGE_BUSINESSES')
+      );
+      allow delete: if (hasPermission('MANAGE_ACCOUNTS_PAYABLE') || hasPermission('MANAGE_PAYMENTS_RECEIPTS') || hasPermission('CHECK_SALE_RECORD')) && (resource.data.status == 'Pending' || resource.data.status == 'Approved');
+    }
+
+    match /balance_adjustments/{adjustmentId} {
+      allow get: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_ACCOUNTS_PAYABLE') ||
+        hasPermission('VIEW_CLIENTS_BUSINESSES')
+      );
+      allow list: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_ACCOUNTS_PAYABLE') ||
+        hasPermission('VIEW_CLIENTS_BUSINESSES') ||
+        hasPermission('EDIT_CLIENT') ||
+        hasPermission('EDIT_BUSINESS')
+      );
+      allow create, update, delete: if hasPermission('MANAGE_ACCOUNTS_PAYABLE') || hasPermission('MERGE_CLIENTS') || hasPermission('MERGE_BUSINESSES');
+    }
+
+    match /refunds/{refundId} {
+      // Allow get if user has permission to view finance or manage refunds, or view clients/businesses
+      // This allows viewing refunds on Client/Business detail pages
+      // Refund fields: clientId, businessId, amountMMK, serviceId (optional), totalUSD (optional), rate (optional), reason, description, status, etc.
+      allow get: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+        hasPermission('MANAGE_ACCOUNTS_PAYABLE') ||
+        (hasPermission('VIEW_CLIENTS_BUSINESSES') && (
+          resource.data.clientId != null || 
+          resource.data.businessId != null
+        ))
+      );
+      // Allow list for authenticated users with proper permissions
+      // Queries are filtered by clientId/businessId in the app for detail pages
+      allow list: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_PAYMENTS_RECEIPTS') ||
+        hasPermission('MANAGE_ACCOUNTS_PAYABLE') ||
+        hasPermission('VIEW_CLIENTS_BUSINESSES') ||
+        hasPermission('EDIT_CLIENT') ||
+        hasPermission('EDIT_BUSINESS')
+      );
+      // Create refund requires MANAGE_PAYMENTS_RECEIPTS or MANAGE_ACCOUNTS_PAYABLE
+      // Supports optional serviceId, totalUSD, and rate fields for service-based refunds (e.g., Facebook Boosting)
+      allow create: if hasPermission('MANAGE_PAYMENTS_RECEIPTS') || hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+      // Update refund - only pending refunds can be updated, or processing refunds
+      // Allows updating serviceId, totalUSD, rate, amountMMK, reason, description, and other fields
+      // MERGE_CLIENTS allows updating clientId during merge (any status)
+      // MERGE_BUSINESSES allows updating businessId during merge (any status)
+      allow update: if hasPermission('MERGE_CLIENTS') || hasPermission('MERGE_BUSINESSES') || (
+        (hasPermission('MANAGE_PAYMENTS_RECEIPTS') || hasPermission('MANAGE_ACCOUNTS_PAYABLE')) && (
+          resource.data.status == 'Pending' ||
+          (resource.data.status == 'Pending' && request.resource.data.status == 'Processed')
+        )
+      );
+      // Delete refund - only pending refunds can be deleted
+      allow delete: if (
+        hasPermission('MANAGE_PAYMENTS_RECEIPTS') || hasPermission('MANAGE_ACCOUNTS_PAYABLE')
+      ) && resource.data.status == 'Pending';
+    }
+    
+    match /expenses/{expenseId} {
+      allow get: if hasPermission('MANAGE_EXPENSES');
+      allow create: if hasPermission('MANAGE_EXPENSES');
+      allow update, delete: if hasPermission('MANAGE_EXPENSES');
+      allow list: if isAuthenticated();
+    }
+    
+    match /visa_cards/{cardId} {
+      allow get: if hasPermission('MANAGE_VISA_CARDS');
+      allow create: if hasPermission('MANAGE_VISA_CARDS');
+      allow update, delete: if hasPermission('MANAGE_VISA_CARDS');
+      allow list: if isAuthenticated();
+    }
+    
+    match /visa_card_spends/{spendId} {
+      allow get, list: if isAuthenticated() && (
+        hasPermission('MANAGE_VISA_CARDS') ||
+        hasPermission('VIEW_FINANCE_DASHBOARD')
+      );
+      allow create, update, delete: if hasPermission('MANAGE_VISA_CARDS');
+    }
+    
+    match /visa_reloads/{reloadId} {
+      allow get: if hasPermission('MANAGE_VISA_CARDS');
+      allow create: if hasPermission('MANAGE_VISA_CARDS');
+      allow update, delete: if hasPermission('MANAGE_VISA_CARDS');
+      allow list: if isAuthenticated();
+    }
+    
+    match /daily_exchange_rates/{rateId} {
+      allow get, list: if isAuthenticated() && (
+        hasPermission('MANAGE_VISA_CARDS') ||
+        hasPermission('VIEW_FINANCE_DASHBOARD')
+      );
+      allow create, update, delete: if hasPermission('MANAGE_VISA_CARDS');
+    }
+
+    match /chart_of_accounts/{accountId} {
+      allow read: if hasPermission('VIEW_GL');
+      allow create: if hasPermission('MANAGE_CHART_OF_ACCOUNTS');
+      allow update, delete: if hasPermission('MANAGE_CHART_OF_ACCOUNTS');
+    }
+
+    match /journal_entries/{journalId} {
+      allow read: if hasPermission('VIEW_GL');
+      allow create: if hasPermission('POST_GL');
+      allow update, delete: if hasPermission('POST_GL');
+    }
+
+    match /finance_vendors/{vendorId} {
+      allow get: if hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+      allow list: if isAuthenticated() && hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+      allow create: if hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+      allow update, delete: if hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+    }
+
+    match /ap_invoices/{invoiceId} {
+      allow get: if hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+      allow list: if isAuthenticated() && hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+      allow create: if hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+      allow update, delete: if hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+    }
+
+    match /finance_customers/{customerId} {
+      allow read: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE');
+      allow create: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') || hasPermission('MERGE_CLIENTS') || hasPermission('MERGE_BUSINESSES');
+      allow update, delete: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') || hasPermission('MERGE_CLIENTS') || hasPermission('MERGE_BUSINESSES');
+    }
+
+    match /ar_invoices/{invoiceId} {
+      allow read: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE');
+      allow create: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE');
+      allow update, delete: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE');
+    }
+
+    match /cash_accounts/{accountId} {
+      allow read: if hasPermission('MANAGE_TREASURY') || hasPermission('MANAGE_PAYMENTS_RECEIPTS');
+      allow create: if hasPermission('MANAGE_TREASURY');
+      allow update: if hasPermission('MANAGE_TREASURY') || hasPermission('MANAGE_PAYMENTS_RECEIPTS');
+      allow delete: if hasPermission('MANAGE_TREASURY');
+    }
+
+    match /cash_transactions/{txnId} {
+      allow read: if hasPermission('MANAGE_TREASURY');
+      allow create: if hasPermission('MANAGE_TREASURY');
+      allow update, delete: if hasPermission('MANAGE_TREASURY');
+    }
+
+    match /fixed_assets/{assetId} {
+      allow read: if hasPermission('MANAGE_FIXED_ASSETS');
+      allow create: if hasPermission('MANAGE_FIXED_ASSETS');
+      allow update, delete: if hasPermission('MANAGE_FIXED_ASSETS');
+    }
+
+    match /asset_events/{eventId} {
+      allow read: if hasPermission('MANAGE_FIXED_ASSETS');
+      allow create: if hasPermission('MANAGE_FIXED_ASSETS');
+      allow update, delete: if hasPermission('MANAGE_FIXED_ASSETS');
+    }
+
+    match /finance_loans/{loanId} {
+      allow get: if hasPermission('MANAGE_CAPITAL');
+      allow list: if isAuthenticated() && hasPermission('MANAGE_CAPITAL');
+      allow create: if hasPermission('MANAGE_CAPITAL');
+      allow update, delete: if hasPermission('MANAGE_CAPITAL');
+    }
+
+    match /finance_loan_payments/{paymentId} {
+      allow get: if hasPermission('MANAGE_CAPITAL');
+      allow list: if isAuthenticated() && hasPermission('MANAGE_CAPITAL');
+      allow create: if hasPermission('MANAGE_CAPITAL');
+      allow update, delete: if hasPermission('MANAGE_CAPITAL');
+    }
+
+    match /finance_equity_events/{eventId} {
+      allow get: if (hasPermission('MANAGE_CAPITAL') || hasPermission('VIEW_FINANCIAL_REPORTS'));
+      allow list: if isAuthenticated() && (hasPermission('MANAGE_CAPITAL') || hasPermission('VIEW_FINANCIAL_REPORTS'));
+      allow create: if hasPermission('MANAGE_CAPITAL');
+      allow update, delete: if hasPermission('MANAGE_CAPITAL');
+    }
+
+    // Bad Debts Management
+    match /bad_debts/{badDebtId} {
+      allow get: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') ||
+        hasPermission('MANAGE_ACCOUNTS_PAYABLE')
+      );
+      allow list: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') ||
+        hasPermission('MANAGE_ACCOUNTS_PAYABLE') ||
+        hasPermission('VIEW_CLIENTS_BUSINESSES') ||
+        hasPermission('EDIT_CLIENT') ||
+        hasPermission('EDIT_BUSINESS')
+      );
+      allow create: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') || hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+      allow update: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') || hasPermission('MANAGE_ACCOUNTS_PAYABLE') || hasPermission('MERGE_CLIENTS') || hasPermission('MERGE_BUSINESSES');
+      allow delete: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') || hasPermission('MANAGE_ACCOUNTS_PAYABLE');
+    }
+
+    // Allowance for Doubtful Debts
+    match /allowance_doubtful_debts/{allowanceId} {
+      allow get: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') ||
+        hasPermission('VIEW_FINANCIAL_REPORTS')
+      );
+      allow list: if isAuthenticated() && (
+        hasPermission('VIEW_FINANCE_DASHBOARD') ||
+        hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') ||
+        hasPermission('VIEW_FINANCIAL_REPORTS')
+      );
+      allow create: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE');
+      allow update, delete: if hasPermission('MANAGE_ACCOUNTS_RECEIVABLE') || hasPermission('MERGE_BUSINESSES');
+    }
+    
+    // --- HR ---
+    match /payslips/{payslipId} {
+      allow get: if (hasPermission('VIEW_PAYROLL_ADMIN') || (hasPermission('VIEW_OWN_PAYSLIP') && resource.data.employeeId == request.auth.uid));
+      allow list: if isAuthenticated();
+      allow create: if (getUserData().role == 'Owner' || getUserData().role == 'Admin' || hasPermission('GENERATE_PAYROLL'));
+      allow update: if (hasPermission('EDIT_PAYSLIP') || hasPermission('MARK_PAYSLIP_PAID'));
+      allow delete: if hasPermission('DELETE_PAYSLIP');
+    }
+    
+    // --- CORRECTED LEAVE REQUESTS RULE ---
+    match /leave_requests/{leaveId} {
+      // Admin can get any request. A user can get their own if they have the permission and the employeeId matches their profile.
+      allow get: if (hasPermission('VIEW_LEAVE_ADMIN') || (
+        hasPermission('VIEW_OWN_LEAVE_REQUESTS') && 
+        resource.data.employeeId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.employeeId
+      ));
+      
+      // A user can list requests. The get rule will be enforced by Firestore on the results of any query.
+      allow list: if isAuthenticated();
+      
+      // A user can create a request if they have permission AND the employeeId in the new doc matches their own employeeId.
+      allow create: if hasPermission('CREATE_LEAVE_REQUEST') &&
+        request.resource.data.employeeId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.employeeId;
+      
+      // An admin can approve/decline. A user can update their own request (e.g., cancel it).
+      allow update: if (hasPermission('APPROVE_LEAVE_REQUESTS') ||
+        (resource.data.employeeId == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.employeeId));
+    }
+    
+    match /holidays/{holidayId} { 
+      allow read: if isAuthenticated(); 
+      allow create: if hasPermission('MANAGE_HOLIDAYS');
+      allow update, delete: if hasPermission('MANAGE_HOLIDAYS');
+    }
+    match /attendance_reports/{reportId} { 
+      allow get: if hasPermission('MANAGE_ATTENDANCE');
+      allow create: if hasPermission('MANAGE_ATTENDANCE');
+      allow update, delete: if hasPermission('MANAGE_ATTENDANCE');
+      allow list: if isAuthenticated();
+    }
+    
+    match /attendance_rules_settings/{settingId} {
+      allow get, list: if hasPermission('MANAGE_ATTENDANCE');
+      allow create, update, delete: if hasPermission('MANAGE_ATTENDANCE');
+    }
+    
+    // --- TASKS & PROJECTS ---
+    match /tasks/{taskId} {
+      allow get: if (hasPermission('VIEW_ALL_TASKS') || (hasPermission('VIEW_TASKS') && (('assigneeIds' in resource.data && request.auth.uid in resource.data.assigneeIds) || isOwnerOfDoc())));
+      allow list: if isAuthenticated();
+      allow create: if hasPermission('CREATE_TASK');
+      allow update: if (hasPermission('EDIT_ALL_TASKS') || (hasPermission('EDIT_TASK') && (('assigneeIds' in resource.data && request.auth.uid in resource.data.assigneeIds) || isOwnerOfDoc())));
+      allow delete: if (hasPermission('DELETE_ALL_TASKS') || (hasPermission('DELETE_TASK') && isOwnerOfDoc()));
+    }
+    
+    match /task_lists/{listId} {
+        allow get: if hasPermission('VIEW_TASKS');
+        allow list: if isAuthenticated();
+        allow create: if hasPermission('CREATE_TASK');
+        allow update: if (hasPermission('EDIT_ALL_TASKS') || hasPermission('EDIT_TASK'));
+        allow delete: if (hasPermission('DELETE_ALL_TASKS') || hasPermission('DELETE_TASK'));
+    }
+    
+    match /projects/{projectId} {
+      allow get: if (hasPermission('VIEW_ALL_PROJECTS') || (hasPermission('VIEW_PROJECTS') && (resource.data.teamLeadId == request.auth.uid || request.auth.uid in resource.data.memberIds)));
+      allow list: if isAuthenticated();
+      allow create: if hasPermission('CREATE_PROJECT');
+      allow update: if hasPermission('EDIT_PROJECT');
+      allow delete: if hasPermission('DELETE_PROJECT');
+    }
+    
+    // --- TRAINING CENTER ---
+    match /students/{studentId} {
+      allow get: if hasPermission('MANAGE_STUDENTS');
+      allow list: if isAuthenticated();
+      allow create: if hasPermission('MANAGE_STUDENTS');
+      allow update, delete: if hasPermission('MANAGE_STUDENTS');
+    }
+    
+    match /courses/{courseId} {
+      allow read: if true;
+      allow create: if hasPermission('MANAGE_COURSES');
+      allow update, delete: if hasPermission('MANAGE_COURSES');
+    }
+    
+    match /batches/{batchId} {
+      allow read: if isAuthenticated();
+      allow create: if hasPermission('MANAGE_BATCHES');
+      allow update, delete: if hasPermission('MANAGE_BATCHES');
+    }
+    
+    match /student_payments/{paymentId} {
+      allow get: if hasPermission('VIEW_TRAINING_RECEIPTS');
+      allow create: if hasPermission('MANAGE_STUDENT_PAYMENTS');
+      allow update, delete: if hasPermission('MANAGE_STUDENT_PAYMENTS');
+      allow list: if isAuthenticated();
+    }
+    
+    match /certificates/{certificateId} {
+      allow read: if true;
+      allow create: if hasPermission('MANAGE_CERTIFICATES');
+      allow update, delete: if hasPermission('MANAGE_CERTIFICATES');
+      allow list: if isAuthenticated();
+    }
+    
+    match /signatures/{signatureId} {
+      allow get: if hasPermission('MANAGE_SIGNATURE_LIBRARY');
+      allow create: if hasPermission('MANAGE_SIGNATURE_LIBRARY');
+      allow update, delete: if hasPermission('MANAGE_SIGNATURE_LIBRARY');
+      allow list: if isAuthenticated();
+    }
+    
+    match /appointments/{appointmentId} {
+      allow list, get: if hasPermission('MANAGE_TRAINING_SCHEDULE');
+      allow create: if hasPermission('MANAGE_APPOINTMENTS');
+      allow delete: if hasPermission('MANAGE_APPOINTMENTS');
+    }
+    
+    // --- QUIZZES & SURVEYS ---
+    match /quizzes/{quizId} {
+      allow read: if true;
+      allow list: if hasPermission('MANAGE_QUIZZES') || hasPermission('MANAGE_SURVEYS');
+      allow create: if (hasPermission('MANAGE_QUIZZES') || hasPermission('MANAGE_SURVEYS'));
+      allow update, delete: if (hasPermission('MANAGE_QUIZZES') || hasPermission('MANAGE_SURVEYS'));
+      
+      match /questions/{questionId} {  
+        allow read: if true;  
+        allow create: if (hasPermission('MANAGE_QUIZZES') || hasPermission('MANAGE_SURVEYS'));
+        allow update, delete: if (hasPermission('MANAGE_QUIZZES') || hasPermission('MANAGE_SURVEYS'));
+      }
+      match /sections/{sectionId} {  
+        allow read: if true;
+        allow create: if (hasPermission('MANAGE_QUIZZES') || hasPermission('MANAGE_SURVEYS'));
+        allow update, delete: if (hasPermission('MANAGE_QUIZZES') || hasPermission('MANAGE_SURVEYS'));
+      }
+    }
+    
+    match /quiz_attempts/{attemptId} {  
+      allow create: if true;  
+      allow read: if hasPermission('MANAGE_QUIZZES');  
+    }
+    
+    match /survey_submissions/{submissionId} {  
+      allow create: if true;  
+      allow get, list: if hasPermission('MANAGE_SURVEYS');
+      allow update, delete: if hasPermission('MANAGE_SURVEYS');
+    }
+    
+    // --- SETTINGS & CONFIG ---
+    match /settings/{docId} {
+      // General read for some settings like companyProfile
+      allow read: if true;
+      // Write rules are more specific and should be checked via permission enums
+      allow write: if (
+        (docId == 'companyProfile' && hasPermission('MANAGE_COMPANY_PROFILE')) ||
+        (docId == 'smsSettings' && hasPermission('MANAGE_SMS_SETTINGS'))
+      );
+    }
+    
+    match /settings_payment_methods/{docId} {
+      allow read: if true;
+      allow write: if hasPermission('MANAGE_SYSTEM_LISTS');
+    }
+    
+    match /settings_expense_categories/{docId} { 
+      allow read: if isAuthenticated(); 
+      allow create, update, delete: if hasPermission('MANAGE_EXPENSES');
+    }
+    match /settings_lead_sources/{docId} { allow read: if isAuthenticated(); allow write: if hasPermission('MANAGE_SYSTEM_LISTS'); }
+    match /settings_business_types/{docId} { allow read: if isAuthenticated(); allow write: if hasPermission('MANAGE_SYSTEM_LISTS'); }
+    match /settings_campaign_objectives/{docId} { allow read: if isAuthenticated(); allow write: if hasPermission('MANAGE_SYSTEM_LISTS'); }
+    // Fixed Asset Categories - Management settings for asset categorization
+    match /settings_asset_categories/{docId} { 
+      allow read: if isAuthenticated(); 
+      allow create, update, delete: if hasPermission('MANAGE_FIXED_ASSETS'); 
+    }
+    
+    match /kpi_categories/{docId} { allow read: if isAuthenticated(); allow write: if hasPermission('MANAGE_SYSTEM_LISTS'); }
+    match /role_permissions/{roleId} {
+      // Users may read their own global/dept role config (needed for login permission sync with rules)
+      allow get: if isAuthenticated() && (
+        roleId == 'GLOBAL_' + getUserData().role ||
+        (
+          'departmentId' in getUserData() &&
+          getUserData().departmentId != '' &&
+          roleId == getUserData().departmentId + '_' + getUserData().role
+        ) ||
+        hasPermission('MANAGE_ROLES_PERMISSIONS')
+      );
+      allow list: if hasPermission('MANAGE_ROLES_PERMISSIONS');
+      allow create, update, delete: if hasPermission('MANAGE_ROLES_PERMISSIONS');
+    }
+    match /departments/{deptId} { allow read: if isAuthenticated(); allow write: if hasPermission('MANAGE_DEPARTMENTS'); }
+    
+    // --- FACEBOOK INTEGRATIONS ---
+    match /facebook_integrations/{userId} {
+      allow read, write: if isAuthenticated() && isSelf(userId);
+    }
+    
+    // --- SMS Communication ---
+    match /sms_templates/{templateId} {
+      allow read: if hasPermission('VIEW_SMS_MODULE');
+      allow create: if hasPermission('MANAGE_SMS_TEMPLATES');
+      allow update, delete: if hasPermission('MANAGE_SMS_TEMPLATES');
+    }
+
+    match /sms_batches/{batchId} {
+      allow read: if hasPermission('VIEW_SMS_MODULE');
+      allow create: if hasPermission('SEND_SMS') && request.resource.data.createdByUserId == request.auth.uid;
+      allow update, delete: if (isAdmin() || (hasPermission('SEND_SMS') && isOwnerOfDoc()));
+    }
+    
+    match /sms_messages/{messageId} {
+      allow read: if hasPermission('VIEW_SMS_MODULE');
+      allow create: if hasPermission('SEND_SMS');
+      // FIX: Allow update if the user has permission and created the parent batch.
+      allow update: if hasPermission('SEND_SMS') &&
+                      get(/databases/$(database)/documents/sms_batches/$(resource.data.batchId)).data.createdByUserId == request.auth.uid;      allow delete: if false; // Deleting individual messages is not a current feature
+    }
+    
+    // --- KPIs ---
+    match /kpis/{kpiId} { 
+      allow get: if hasPermission('MANAGE_KPI_LIBRARY');
+      allow create: if hasPermission('MANAGE_KPI_LIBRARY');
+      allow update, delete: if hasPermission('MANAGE_KPI_LIBRARY');
+      allow list: if isAuthenticated();
+    }
+    match /employee_kpi_sheets/{sheetId} {
+      allow get: if (hasPermission('VIEW_TEAM_KPIS') || (hasPermission('VIEW_OWN_KPI_SHEET') && request.auth.uid == resource.data.employeeId));
+      allow list: if isAuthenticated();
+      allow create: if (hasPermission('ASSIGN_KPIS') || hasPermission('PERFORM_SELF_EVALUATION') || hasPermission('RATE_TEAM_KPIS'));
+      allow update, delete: if (hasPermission('ASSIGN_KPIS') || hasPermission('PERFORM_SELF_EVALUATION') || hasPermission('RATE_TEAM_KPIS'));
+    }
+    
+       // --- SYSTEM COLLECTIONS ---
+    match /counters/{counterId} {  
+      allow read, write: if isAuthenticated(); // 'write' covers create and update
+      allow delete: if false;  
+    }
+    
+    match /employee_onboarding/{employeeId} {
+        allow get: if (hasPermission('MANAGE_ONBOARDING') || (hasPermission('VIEW_OWN_ONBOARDING') && isSelf(employeeId)));
+        allow create: if (hasPermission('MANAGE_ONBOARDING') || (hasPermission('VIEW_OWN_ONBOARDING') && isSelf(employeeId)));
+        allow update: if (hasPermission('MANAGE_ONBOARDING') || (hasPermission('VIEW_OWN_ONBOARDING') && isSelf(employeeId)));
+    }
+
+    // --- ACTIVITY LOG ---
+    match /activityLogs/{logId} {
+      allow create: if isAuthenticated();
+      allow get, list: if hasPermission('VIEW_ACTIVITY_LOG');
+      allow update, delete: if false;
+    }
+
+    // --- POS SYSTEM ---
+    match /pos_products/{productId} {
+      allow get: if (hasPermission('VIEW_POS') || hasPermission('MANAGE_POS_PRODUCTS'));
+      allow list: if isAuthenticated() && (hasPermission('VIEW_POS') || hasPermission('MANAGE_POS_PRODUCTS'));
+      allow create: if hasPermission('MANAGE_POS_PRODUCTS');
+      allow update, delete: if hasPermission('MANAGE_POS_PRODUCTS');
+    }
+
+    match /pos_orders/{orderId} {
+      allow get: if (hasPermission('VIEW_POS') || hasPermission('MANAGE_POS_ORDERS') || hasPermission('CREATE_POS_ORDER'));
+      allow list: if isAuthenticated() && (hasPermission('VIEW_POS') || hasPermission('MANAGE_POS_ORDERS'));
+      allow create: if hasPermission('CREATE_POS_ORDER') && request.resource.data.createdByUserId == request.auth.uid;
+      allow update, delete: if hasPermission('MANAGE_POS_ORDERS');
+    }
+
+    match /inventory_transactions/{transactionId} {
+      allow get: if (hasPermission('VIEW_POS') || hasPermission('MANAGE_POS_INVENTORY'));
+      allow list: if isAuthenticated() && (hasPermission('VIEW_POS') || hasPermission('MANAGE_POS_INVENTORY'));
+      allow create: if hasPermission('MANAGE_POS_INVENTORY') && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if hasPermission('MANAGE_POS_INVENTORY');
+    }
+
+    match /pos_revenue/{revenueId} {
+      allow get: if hasPermission('VIEW_POS_REVENUE');
+      allow list: if isAuthenticated() && hasPermission('VIEW_POS_REVENUE');
+      allow create: if hasPermission('CREATE_POS_ORDER');
+      allow update, delete: if hasPermission('MANAGE_POS_ORDERS');
+    }
+
+    match /pos_customers/{customerId} {
+      allow get: if (hasPermission('VIEW_POS') || hasPermission('CREATE_POS_ORDER'));
+      allow list: if isAuthenticated() && (hasPermission('VIEW_POS') || hasPermission('CREATE_POS_ORDER'));
+      allow create: if hasPermission('CREATE_POS_ORDER');
+      allow update, delete: if hasPermission('MANAGE_POS_ORDERS');
+    }
+
+    match /pos_categories/{categoryId} {
+      allow get: if (hasPermission('VIEW_POS') || hasPermission('MANAGE_POS_PRODUCTS'));
+      allow list: if isAuthenticated() && (hasPermission('VIEW_POS') || hasPermission('MANAGE_POS_PRODUCTS'));
+      allow create: if hasPermission('MANAGE_POS_PRODUCTS');
+      allow update, delete: if hasPermission('MANAGE_POS_PRODUCTS');
+    }
+  }
+}

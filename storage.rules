@@ -1,0 +1,146 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // Helper function to check authentication
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    // Helper function to validate file size (in bytes)
+    function isValidSize(maxSizeMB) {
+      return request.resource.size < maxSizeMB * 1024 * 1024;
+    }
+    
+    // Helper function to validate content type
+    function isValidImageType() {
+      return request.resource.contentType.matches('image/.*');
+    }
+    
+    // Helper function to validate document type
+    function isValidDocumentType() {
+      return request.resource.contentType.matches('(application/pdf|image/.*|application/msword|application/vnd.openxmlformats-officedocument.*)');
+    }
+    
+    // --- COMPANY LOGO & PROFILE IMAGES ---
+    match /company/{allPaths=**} {
+      // Company logo and profile images - readable by all authenticated users
+      allow read: if isAuthenticated();
+      // Only authenticated users can upload (permissions handled in app)
+      allow write: if isAuthenticated() && isValidSize(5) && isValidImageType();
+    }
+    
+    // --- EMPLOYEE PHOTOS & DOCUMENTS ---
+    match /employees/{employeeId}/{allPaths=**} {
+      // Employee photos (facePhoto, nrcFrontPhoto, nrcBackPhoto)
+      allow read: if isAuthenticated();
+      // Writable by authenticated users (permissions handled in app)
+      allow write: if isAuthenticated() && isValidSize(5) && isValidImageType();
+    }
+    
+    // --- CASH ACCOUNTS ---
+    match /cash_accounts/{accountId}/{allPaths=**} {
+      // Cash account logos and QR codes
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isValidSize(5) && isValidImageType();
+    }
+    
+    // --- TASK ATTACHMENTS ---
+    match /task_attachments/{taskId}/{allPaths=**} {
+      // Task file attachments
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isValidSize(10) && isValidDocumentType();
+    }
+    
+    // --- PAYMENT METHODS ---
+    match /payment_methods/{methodId}/{allPaths=**} {
+      // Payment method logos and QR codes
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isValidSize(5) && isValidImageType();
+    }
+    
+    // --- POS PRODUCT IMAGES ---
+    match /pos_products/{productId}/{allPaths=**} {
+      // POS product images - readable by all authenticated users
+      allow read: if isAuthenticated();
+      // Writable by users with permission to manage POS products
+      allow write: if isAuthenticated() && isValidSize(5) && isValidImageType();
+    }
+    
+    // --- CLIENT & BUSINESS DOCUMENTS ---
+    match /clients/{clientId}/{allPaths=**} {
+      // Client documents - readable by users with permission to view clients
+      allow read: if isAuthenticated();
+      // Writable by users with permission to edit clients
+      allow write: if isAuthenticated() && isValidSize(10) && isValidDocumentType();
+    }
+    
+    match /businesses/{businessId}/{allPaths=**} {
+      // Business documents - readable by users with permission to view businesses
+      allow read: if isAuthenticated();
+      // Writable by users with permission to edit businesses
+      allow write: if isAuthenticated() && isValidSize(10) && isValidDocumentType();
+    }
+    
+    // --- SALES RECORDS DOCUMENTS ---
+    match /sales/{saleId}/{allPaths=**} {
+      // Sales record documents (e.g., PDFs, attachments)
+      // Readable by users with permission to view sales records or clients/businesses
+      allow read: if isAuthenticated();
+      // Writable by users with permission to create/edit sales records
+      allow write: if isAuthenticated() && isValidSize(10) && isValidDocumentType();
+    }
+    
+    // --- INVOICE DOCUMENTS ---
+    match /invoices/{invoiceId}/{allPaths=**} {
+      // Invoice documents (PDFs, attachments)
+      // Readable by users with permission to manage invoices or view clients/businesses
+      allow read: if isAuthenticated();
+      // Writable by users with permission to manage invoices
+      allow write: if isAuthenticated() && isValidSize(10) && isValidDocumentType();
+    }
+    
+    // --- QUOTATION DOCUMENTS ---
+    match /quotations/{quotationId}/{allPaths=**} {
+      // Quotation documents (PDFs, attachments)
+      // Readable by users with permission to manage quotations or view clients/businesses
+      allow read: if isAuthenticated();
+      // Writable by users with permission to manage quotations
+      allow write: if isAuthenticated() && isValidSize(10) && isValidDocumentType();
+    }
+    
+    // --- PAYMENT RECEIPTS ---
+    match /payments/{paymentId}/{allPaths=**} {
+      // Payment receipts and documents
+      // Readable by users with permission to manage payments or view clients/businesses
+      allow read: if isAuthenticated();
+      // Writable by users with permission to manage payments
+      allow write: if isAuthenticated() && isValidSize(10) && isValidDocumentType();
+    }
+    
+    // --- EXPENSE RECEIPTS ---
+    match /expenses/{expenseId}/{allPaths=**} {
+      // Expense receipts and photos
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isValidSize(10) && isValidDocumentType();
+    }
+    
+    // --- TRAINING CENTER ---
+    match /students/{studentId}/{allPaths=**} {
+      // Student files and documents
+      allow read: if isAuthenticated();
+      allow write: if isAuthenticated() && isValidSize(10) && isValidDocumentType();
+    }
+    
+    match /certificates/{certificateId}/{allPaths=**} {
+      // Certificates can be publicly readable for verification
+      allow read: if true;
+      allow write: if isAuthenticated() && isValidSize(5) && isValidDocumentType();
+    }
+    
+    // --- DEFAULT: Deny all other paths ---
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

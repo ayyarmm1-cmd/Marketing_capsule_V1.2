@@ -1,0 +1,32 @@
+User-agent: *
+Allow: /
+
+# Sitemap
+Sitemap: https://marketingcapsule.agency/sitemap.xml
+
+# Disallow admin and private areas
+Disallow: /#/
+Disallow: /api/
+
+# Allow all public pages
+Allow: /
+Allow: /services
+Allow: /services/*
+Allow: /about
+Allow: /contact
+Allow: /portfolio
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
